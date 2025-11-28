@@ -22,7 +22,7 @@ const API_URL = "http://10.10.181.126:8082/api/sos/trigger";
 const UPDATE_URL = "http://10.10.181.126:8082/api/sos/update-location";
 const CONTACTS_URL = "http://10.10.181.126:8082/api/contacts";
 // 🔊 Media upload backend (the one you tested in Postman)
-const MEDIA_UPLOAD_URL = "http://10.10.180.162:8080/api/media/upload";
+const MEDIA_UPLOAD_URL = "http://10.10.180.126:8080/api/media/upload";
 
 type Contact = {
   id: number;
