@@ -17,10 +17,12 @@ import {
 } from "react-native";
 import useVoiceSOS from "../features/voiceSOS/useVoiceSOS";
 
-// 🔁 Update IP here if your Wi-Fi changes
+// 🔁 Update IPs here if your Wi-Fi changes
 const API_URL = "http://10.10.181.126:8082/api/sos/trigger";
 const UPDATE_URL = "http://10.10.181.126:8082/api/sos/update-location";
 const CONTACTS_URL = "http://10.10.181.126:8082/api/contacts";
+// 🔊 Media upload backend (the one you tested in Postman)
+const MEDIA_UPLOAD_URL = "http://10.10.180.162:8080/api/media/upload";
 
 type Contact = {
   id: number;
@@ -51,6 +53,7 @@ export default function HomeScreen() {
   const [intervalId, setIntervalId] = useState<any>(null);
   const [sosId, setSosId] = useState<number | null>(null);
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const recordingTimerRef = useRef<any>(null); // for 1-minute auto-stop
 
   const THRESHOLD = 2.3; // lower = more sensitive, higher = less
 
@@ -68,7 +71,7 @@ export default function HomeScreen() {
   };
 
   // 🔄 Keep track of latest handleMotion to avoid stale closures in listener
-  const handleMotionRef = useRef((data: any) => { });
+  const handleMotionRef = useRef((data: any) => {});
 
   useEffect(() => {
     handleMotionRef.current = handleMotion;
@@ -105,16 +108,33 @@ export default function HomeScreen() {
       if (intervalId) {
         clearInterval(intervalId);
       }
+
+      // clear recording timer if any
+      if (recordingTimerRef.current) {
+        clearTimeout(recordingTimerRef.current);
+      }
     };
   }, [intervalId]);
 
-  const sendSMSWithLocation = async (latitude: number, longitude: number) => {
+  // 📩 SMS (now can include optional audio URL)
+  const sendSMSWithLocation = async (
+    latitude?: number,
+    longitude?: number,
+    audioUrl?: string
+  ) => {
     console.log("📩 Checking SMS availability...");
     const isAvailable = await SMS.isAvailableAsync();
     console.log("📩 SMS available:", isAvailable);
 
-    const mapsLink = `https://www.google.com/maps?q=${latitude},${longitude}`;
-    const message = `🚨 EMERGENCY! I need help.\nMy Location:\n${mapsLink}`;
+    let mapsPart = "";
+    if (latitude != null && longitude != null) {
+      const mapsLink = `https://www.google.com/maps?q=${latitude},${longitude}`;
+      mapsPart = `\nMy Location:\n${mapsLink}`;
+    }
+
+    const audioPart = audioUrl ? `\nAudio Evidence:\n${audioUrl}` : "";
+
+    const message = `🚨 EMERGENCY! I need help.${mapsPart}${audioPart}`;
 
     const recipients =
       contacts.length > 0
@@ -165,22 +185,103 @@ export default function HomeScreen() {
     }
   };
 
-  // 🎙 Stop audio recording
+  // ☁️ Upload recording file to /api/media/upload and get URL
+  const uploadAudio = async (fileUri: string): Promise<string | null> => {
+    try {
+      console.log("☁️ Uploading audio:", fileUri);
+
+      const fileName = fileUri.split("/").pop() || "Distress.mp3";
+
+      const formData: any = new FormData();
+      formData.append("file", {
+        uri: fileUri,
+        name: fileName,
+        type: "audio/mpeg",
+      } as any);
+
+      const response = await fetch(MEDIA_UPLOAD_URL, {
+        method: "POST",
+        headers: {
+          // let fetch set the boundary
+          "Content-Type": "multipart/form-data",
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        console.log("☁️ Upload failed, status:", response.status);
+        return null;
+      }
+
+      const json = await response.json();
+      console.log("☁️ Upload success, response:", json);
+
+      // backend returns: { "url": "http://.../uploads/xxx_Distress.mp3" }
+      return json.url;
+    } catch (err: any) {
+      console.log("☁️ Upload error:", err?.message || err);
+      return null;
+    }
+  };
+
+  // 🎙 Stop audio recording + upload + send SMS with audio link
   const stopRecording = async () => {
     try {
-      if (!recording) return;
+      if (!recording) {
+        console.log("🎙 No active recording to stop.");
+        return;
+      }
+
       console.log("🎙 Stopping recording...");
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
       console.log("📁 Audio file saved at:", uri);
       setRecording(null);
-      Alert.alert("Recording Saved", "Audio evidence stored locally.");
+
+      if (!uri) {
+        Alert.alert("Recording Error", "Could not get audio file URI.");
+        return;
+      }
+
+      // 1️⃣ Upload audio to backend
+      const audioUrl = await uploadAudio(uri);
+
+      if (!audioUrl) {
+        Alert.alert("Upload Failed", "Could not upload audio evidence.");
+        return;
+      }
+
+      // 2️⃣ Get current location (optional but nice to have)
+      let latitude: number | undefined;
+      let longitude: number | undefined;
+
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status === "granted") {
+          const loc = await Location.getCurrentPositionAsync({});
+          latitude = loc.coords.latitude;
+          longitude = loc.coords.longitude;
+          console.log("📍 Location for audio SMS:", latitude, longitude);
+        } else {
+          console.log("📍 Location permission not granted for audio SMS.");
+        }
+      } catch (e: any) {
+        console.log("📍 Location error for audio SMS:", e?.message || e);
+      }
+
+      // 3️⃣ Send SMS with audio link (+ location if available)
+      await sendSMSWithLocation(latitude, longitude, audioUrl);
+
+      Alert.alert(
+        "Recording Shared",
+        "Audio evidence link has been sent to emergency contacts."
+      );
     } catch (err) {
       console.log("🎙 Stop recording error:", err);
     }
   };
 
-  // 🛰 Send updated location every 5 seconds
+  // 🛰 Send updated location every 5 seconds to backend
   const sendLocationUpdate = async () => {
     if (!tracking || !sosId) return;
 
@@ -215,7 +316,16 @@ export default function HomeScreen() {
     // Start audio recording
     await startRecording();
 
-    // Start interval
+    // Auto stop recording after 1 minute
+    if (recordingTimerRef.current) {
+      clearTimeout(recordingTimerRef.current);
+    }
+    recordingTimerRef.current = setTimeout(() => {
+      console.log("⏰ Auto-stopping recording after 1 minute");
+      stopRecording(); // this will upload + send SMS with audio link
+    }, 60000);
+
+    // Start interval for continuous location updates
     const id = setInterval(() => {
       sendLocationUpdate();
     }, 5000); // 5 seconds
@@ -232,6 +342,12 @@ export default function HomeScreen() {
       setIntervalId(null);
     }
 
+    if (recordingTimerRef.current) {
+      clearTimeout(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+
+    // Stop recording immediately, upload & send audio link
     await stopRecording();
 
     setSosId(null);
@@ -290,7 +406,7 @@ export default function HomeScreen() {
         console.log("❌ Backend error:", err?.message || err);
       }
 
-      // 3️⃣ SMS to all contacts
+      // 3️⃣ Immediate SMS (location only)
       if (latitude !== null && longitude !== null) {
         smsOk = await sendSMSWithLocation(latitude, longitude);
       }
@@ -302,7 +418,7 @@ export default function HomeScreen() {
         smsOk,
       });
 
-      // 5️⃣ Start continuous tracking + recording only if backend succeeded
+      // 5️⃣ Start continuous tracking + audio recording only if backend succeeded
       if (backendOk && createdSosId !== null) {
         await startTracking(createdSosId);
       }
@@ -321,18 +437,19 @@ export default function HomeScreen() {
   };
 
   // 🗣 Voice SOS Hook
-  const { startListening, stopListening, isListening, isModelReady } = useVoiceSOS({
-    onKeywordDetected: async (info: any) => {
-      console.log("🗣 Voice SOS triggered:", info.keyword);
-      // Stop listening immediately to release mic for SOS recording
-      await stopListening();
-      // Trigger Auto SOS
-      triggerAutoSOS();
-    },
-    onError: (err: any) => {
-      console.log("🗣 Voice SOS Error:", err);
-    }
-  });
+  const { startListening, stopListening, isListening, isModelReady } =
+    useVoiceSOS({
+      onKeywordDetected: async (info: any) => {
+        console.log("🗣 Voice SOS triggered:", info.keyword);
+        // Stop listening immediately to release mic for SOS recording
+        await stopListening();
+        // Trigger Auto SOS
+        triggerAutoSOS();
+      },
+      onError: (err: any) => {
+        console.log("🗣 Voice SOS Error:", err);
+      },
+    });
 
   // Manage Voice Listener based on Tracking state and Screen Focus
   useFocusEffect(
@@ -427,7 +544,7 @@ export default function HomeScreen() {
   const logout = async () => {
     try {
       await AsyncStorage.removeItem("token");
-      router.replace("/login");   // now router exists ✔
+      router.replace("/login");
     } catch (error) {
       console.log("❌ Logout error:", error);
     }
@@ -497,7 +614,6 @@ export default function HomeScreen() {
             <TouchableOpacity
               key={c.id}
               style={styles.contactRow}
-              // 🔁 CHANGED: simple tap instead of long-press
               onPress={() => handleDeleteContact(c.id)}
             >
               <View>
@@ -554,10 +670,17 @@ export default function HomeScreen() {
 
         {/* Temporary Test Link */}
         <TouchableOpacity
-          style={{ marginTop: 20, padding: 10, backgroundColor: '#333', borderRadius: 8 }}
-          onPress={() => router.push('/voice-test')}
+          style={{
+            marginTop: 20,
+            padding: 10,
+            backgroundColor: "#333",
+            borderRadius: 8,
+          }}
+          onPress={() => router.push("/voice-test")}
         >
-          <Text style={{ color: 'white', textAlign: 'center' }}>Test Voice SOS Module</Text>
+          <Text style={{ color: "white", textAlign: "center" }}>
+            Test Voice SOS Module
+          </Text>
         </TouchableOpacity>
       </View>
 
@@ -574,7 +697,13 @@ export default function HomeScreen() {
           }}
           onPress={logout}
         >
-          <Text style={{ color: "#f87171", fontSize: 16, fontWeight: "700" }}>
+          <Text
+            style={{
+              color: "#f87171",
+              fontSize: 16,
+              fontWeight: "700",
+            }}
+          >
             Logout
           </Text>
         </TouchableOpacity>
@@ -746,10 +875,10 @@ const styles = StyleSheet.create({
   },
   sosText: {
     color: "white",
-    fontSize: 24, // Reduced size to fit
+    fontSize: 24,
     fontWeight: "900",
     letterSpacing: 1,
-    textAlign: "center", // Center align for multi-line
+    textAlign: "center",
   },
   sosHint: {
     color: "#9ca3af",
